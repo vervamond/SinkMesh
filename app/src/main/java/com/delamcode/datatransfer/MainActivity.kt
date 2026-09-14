@@ -159,13 +159,14 @@ class MainActivity : ComponentActivity() {
             } else {
                 val serverStartIntent = Intent(this, ServerService::class.java)
                 this.startForegroundService(serverStartIntent)
+                mainViewModel.onToggleServer()
             }
         } else {
             val serverStopIntent = Intent(this, ServerService::class.java)
             serverStopIntent.putExtra("Stop", true)
             startService(serverStopIntent)
+            mainViewModel.onToggleServer()
         }
-        mainViewModel.onToggleServer()
     }
 
     val filePicker =
