@@ -153,8 +153,13 @@ class MainActivity : ComponentActivity() {
 
     fun onToggleServer() {
         if (!repo!!.state.value.isRunningServer) {
-            val serverStartIntent = Intent(this, ServerService::class.java)
-            this.startForegroundService(serverStartIntent)
+            val perm = "android.permission.ACCESS_LOCAL_NETWORK"
+            if (ActivityCompat.checkSelfPermission(application, perm) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissionLauncher.launch(perm)
+            } else {
+                val serverStartIntent = Intent(this, ServerService::class.java)
+                this.startForegroundService(serverStartIntent)
+            }
         } else {
             val serverStopIntent = Intent(this, ServerService::class.java)
             serverStopIntent.putExtra("Stop", true)
