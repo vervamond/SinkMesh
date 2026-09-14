@@ -9,7 +9,6 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.net.Uri
-import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
@@ -99,7 +98,7 @@ class ServerService : Service() {
             this,
             1,
             notification!!,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC else 0
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
         )
 
         repo.state
@@ -120,17 +119,25 @@ class ServerService : Service() {
         serverScope.launch {
             try {
                 repo.setServerStatus(true)
-                val uri = repo.state.value.openDirectoryUri
-                if (uri == null) {
-                    Log.e("Server", "no open directory")
+                val dirUri = repo.state.value.openDirectoryUri
+                val fileUri = repo.state.value.openFileUri
+                if (dirUri == null && fileUri == null) {
+                    Log.e("Server", "no open directory or file")
                     return@launch
                 }
                 val files = ArrayList<DocumentFile>()
-                val currentDir = DocumentFile.fromTreeUri(applicationContext, uri)
-                if (currentDir != null) {
-                    for (child in currentDir.listFiles()) {
-                        if (child.isDirectory) continue
-                        files.add(child)
+                if (fileUri != null) {
+                    val singleFile = DocumentFile.fromSingleUri(applicationContext, fileUri)
+                    if (singleFile != null && singleFile.exists()) {
+                        files.add(singleFile)
+                    }
+                } else if (dirUri != null) {
+                    val currentDir = DocumentFile.fromTreeUri(applicationContext, dirUri)
+                    if (currentDir != null) {
+                        for (child in currentDir.listFiles()) {
+                            if (child.isDirectory) continue
+                            files.add(child)
+                        }
                     }
                 }
                 activePort = sharedPref.getInt("port", 8080)
@@ -144,7 +151,7 @@ class ServerService : Service() {
                                 client,
                                 context = applicationContext,
                                 filesRef = files,
-                                uri = uri
+                                uri = dirUri
                             )
                         }
                     } catch (e: SocketException) {
@@ -155,7 +162,7 @@ class ServerService : Service() {
                 stopServer()
             } catch (e: Exception) {
                 Log.e("Server", e.toString())
-                showGeneralDialog("An error occurred: $e")
+                showSnackbar("An error occurred: $e")
                 stopServer()
             } finally {
                 stopServer()
@@ -188,7 +195,7 @@ class ServerService : Service() {
         }
     }
     private fun readHeaders(input: InputStream, initialBuf: ByteArray, initialRead: Int): Pair<String, ByteArray> {
-        @Suppress("SpellCheckingInspection") val baos = ByteArrayOutputStream()
+        val baos = ByteArrayOutputStream()
         if (initialRead > 0) baos.write(initialBuf, 0, initialRead)
         val tmp = ByteArray(1024)
         val sep = byteArrayOf(13, 10, 13, 10) // "\r\n\r\n"
@@ -217,7 +224,12 @@ class ServerService : Service() {
         }
     }
 
-    private suspend fun handleClient(socket: Socket, context: Context, filesRef: ArrayList<DocumentFile>, uri: Uri) {
+    private suspend fun handleClient(
+        socket: Socket,
+        context: Context,
+        filesRef: ArrayList<DocumentFile>,
+        uri: Uri?
+    ) {
         withContext(Dispatchers.IO) {
             try {
                 val repo = (application as DataTransferApp).repository
@@ -265,6 +277,16 @@ class ServerService : Service() {
                     return@withContext
                 }
                 if (method == "PUT" && path.startsWith("/upload")) {
+                    if (repo.state.value.openFileUri != null) {
+                        val body =
+                            "Uploads are disabled when sharing a single file. Choose 'Open Dir' to enable uploads."
+                        val response =
+                            "HTTP/1.1 403 Forbidden\r\nContent-Length: ${body.toByteArray(Charsets.UTF_8).size}\r\nConnection: close\r\n\r\n$body"
+                        out.write(response.toByteArray(Charsets.UTF_8))
+                        out.flush()
+                        socket.close()
+                        return@withContext
+                    }
                     val query = path.substringAfter("?", "")
                     var filename = query.split("&")
                         .mapNotNull { it.takeIf { it.contains("=") }?.split("=", limit = 2) }
@@ -274,22 +296,22 @@ class ServerService : Service() {
 
                     val contentLength = headers["content-length"]?.toLongOrNull()
                     //val isChunked = headers["transfer-encoding"]?.equals("chunked", true) == true
-                    val treeDocumentFile: DocumentFile? = DocumentFile.fromTreeUri(context, uri)
+                    val treeDocumentFile: DocumentFile? = DocumentFile.fromTreeUri(context, uri!!)
                     if (treeDocumentFile == null) {
-                        showGeneralDialog("Failed to create temp directory with error code -1.")
+                        showSnackbar("Failed to create temp directory with error code -1.")
                         socket.close()
                         return@withContext
                     }
                     val tmpExists = treeDocumentFile.findFile("tmp")
                     val tmpDirectory = tmpExists ?: treeDocumentFile.createDirectory("tmp")
                     if (tmpDirectory == null) {
-                        showGeneralDialog("Failed to create temp directory with error code 0.")
+                        showSnackbar("Failed to create temp directory with error code 0.")
                         socket.close()
                         return@withContext
                     }
                     var fileUploadDocumentFile = tmpDirectory.createFile("application/octet-stream", filename)
                     if (fileUploadDocumentFile == null) {
-                        showGeneralDialog("Failed to create temp directory with error code 1.")
+                        showSnackbar("Failed to create temp directory with error code 1.")
                         socket.close()
                         return@withContext
                     }
@@ -333,7 +355,7 @@ class ServerService : Service() {
                         if (renamedFileUri != null) {
                             fileUploadDocumentFile = DocumentFile.fromSingleUri(context, renamedFileUri)
                         } else {
-                            showGeneralDialog("Failed to save file with error code 2.")
+                            showSnackbar("Failed to save file with error code 2.")
                             socket.close()
                             return@withContext
                         }
@@ -342,7 +364,7 @@ class ServerService : Service() {
                         DocumentsContract.moveDocument(context.contentResolver, fileUploadDocumentFile.uri,
                             tmpDirectory.uri, treeDocumentFile.uri)
                     } else {
-                        showGeneralDialog("Failed to create save file with error code 3")
+                        showSnackbar("Failed to create save file with error code 3")
                         socket.close()
                         return@withContext
                     }
@@ -405,7 +427,7 @@ class ServerService : Service() {
                 socket.close()
                 parcelFileDescriptor?.close()
             } catch (e: SocketException) {
-                showGeneralDialog(e.toString())
+                showSnackbar(e.toString())
             } finally {
                 try {
                     socket.close()
@@ -416,7 +438,7 @@ class ServerService : Service() {
         }
     }
 
-    private fun showGeneralDialog(string: String) {
-        repo.setGeneralDialog(string)
+    private fun showSnackbar(string: String) {
+        repo.setSnackbarMessage(string)
     }
 }

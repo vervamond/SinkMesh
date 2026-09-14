@@ -38,7 +38,8 @@ data class UiRepoState (
     var isCheckedHotspot: Boolean = false,
     var isEnabledHotspot: Boolean = true,
     var openDirectoryUri: Uri? = null,
-    var generalDialog: String = "",
+    var openFileUri: Uri? = null,
+    var snackbarMessage: String = "",
     var wifiMode: Int = 0,
     var ssid: String = "",
     var password: String = "",
@@ -46,11 +47,13 @@ data class UiRepoState (
     var serverUri: String = "",
     var qrCodeBitmap: Bitmap? = null,
     var wifiP2pRunning: Boolean = false,
+    var showWifiDisabledDialog: Boolean = false,
 )
 data class UiOnlyState (
     var filePickerWarning: Boolean = false,
     var missingPermission: String = "",
-    var htmlPopup: Boolean = false
+    var htmlPopup: Boolean = false,
+    var isServerReady: Boolean = false
 )
 
 class MainViewModel(private val repo: Repo) : ViewModel() {
@@ -66,15 +69,18 @@ class MainViewModel(private val repo: Repo) : ViewModel() {
                 isCheckedHotspot = uiRepoState.isRunningHotspot,
                 isEnabledHotspot = !uiRepoState.isConnectingHotspot,
                 openDirectoryUri = uiRepoState.openDirectoryUri,
+                openFileUri = uiRepoState.openFileUri,
                 wifiMode = uiRepoState.wifiMode,
                 ssid = uiRepoState.ssid,
                 password = uiRepoState.password,
                 connectedClients = uiRepoState.connectedClients,
                 serverUri = uiRepoState.serverUri,
+                snackbarMessage = uiRepoState.snackbarMessage,
                 qrCodeBitmap = uiRepoState.qrCodeBitmap,
                 wifiP2pRunning = uiRepoState.wifiP2pRunning,
-                generalDialog = uiRepoState.generalDialog),
-            uiOnlyState = uiOnlyState
+                showWifiDisabledDialog = uiRepoState.showWifiDisabledDialog
+            ),
+            uiOnlyState = uiOnlyState.copy(isServerReady = uiRepoState.openDirectoryUri != null || uiRepoState.openFileUri != null)
         )
     }.stateIn(viewModelScope, SharingStarted.Eagerly, UiState(uiRepoState = UiRepoState(), uiOnlyState = UiOnlyState()))
     lateinit var wifiManager: WifiManager
@@ -86,7 +92,7 @@ class MainViewModel(private val repo: Repo) : ViewModel() {
     private val localOnlyHotspotCallback = object : WifiManager.LocalOnlyHotspotCallback() {
         override fun onFailed(reason: Int) {
             super.onFailed(reason)
-            showGeneralDialog("The Local Only Hotspot failed with error code $reason")
+            showSnackbar("The Local Only Hotspot failed with error code $reason")
             Log.e("Hotspot", reason.toString())
             repo.setHotspotStatus(false)
         }
@@ -114,7 +120,7 @@ class MainViewModel(private val repo: Repo) : ViewModel() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 info.wifiSsid?.let { mSsid = it.toString() }
             } else {
-                info.ssid?.let { mSsid = it }
+                @Suppress("DEPRECATION") info.ssid?.let { mSsid = it }
             }
             info.passphrase?.let { mPassword = it }
             mSsid = mSsid.replace("\"", "")
@@ -125,11 +131,11 @@ class MainViewModel(private val repo: Repo) : ViewModel() {
     private val wifiP2pActionListener = object : WifiP2pManager.ActionListener {
         override fun onFailure(reason: Int) {
             if (uiState.value.uiRepoState.wifiP2pRunning) {
-                showGeneralDialog("Starting a WiFiDirect connection failed with error code $reason. It may not be supported on your device.")
+                showSnackbar("Starting a WiFiDirect connection failed with error code $reason. It may not be supported on your device.")
                 Log.e("Hotspot", reason.toString())
                 repo.setHotspotStatus(false)
             } else {
-                showGeneralDialog("Failed to stop WiFiDirect connection with error code $reason.")
+                showSnackbar("Failed to stop WiFiDirect connection with error code $reason.")
                 repo.setHotspotStatus(true)
                 repo.setHotspotConnectingStatus(false)
             }
@@ -155,9 +161,17 @@ class MainViewModel(private val repo: Repo) : ViewModel() {
         repo.setDirectoryUri(uri)
     }
 
+    fun onOpenFile(uri: Uri?) {
+        repo.setOpenFileUri(uri)
+    }
+
     @SuppressLint("MissingPermission", "InlinedApi")
     fun onToggleHotspot() {
         if (!uiState.value.uiRepoState.isCheckedHotspot) {
+            if (uiState.value.uiRepoState.wifiMode != 0 && !wifiManager.isWifiEnabled) {
+                showWifiDisabledDialog(true)
+                return
+            }
             repo.setHotspotStatus(false)
             repo.setHotspotConnectingStatus(true)
             Log.i("Hotspot", "Starting hotspot ${uiState.value.uiRepoState.wifiMode}")
@@ -180,7 +194,7 @@ class MainViewModel(private val repo: Repo) : ViewModel() {
                     repo.setHotspotCredentials(mSsid, mPassword)
                     wifiP2pManager.createGroup(wifiP2pChannel, wifiP2pConfig, wifiP2pActionListener)
                 } catch (e: Exception) {
-                    showGeneralDialog(e.toString())
+                    showSnackbar(e.toString())
                 }
             }
         } else {
@@ -238,12 +252,16 @@ class MainViewModel(private val repo: Repo) : ViewModel() {
         repo.setQrCodeBitmap(null)
     }
 
-    fun showGeneralDialog(string: String) {
-        repo.setGeneralDialog(string)
+    fun showSnackbar(string: String) {
+        repo.setSnackbarMessage(string)
     }
 
-    fun modifyHtml() {
-        //repo.something
+    fun clearSnackbarMessage() {
+        repo.setSnackbarMessage("")
+    }
+
+    fun showWifiDisabledDialog(status: Boolean) {
+        repo.setWifiDisabledDialogStatus(status)
     }
 
     fun showModifyHtmlPopup(state: Boolean) {

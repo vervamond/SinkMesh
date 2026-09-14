@@ -12,6 +12,10 @@ import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Parcelable
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
+import android.provider.Settings
 import android.view.Window
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -20,12 +24,12 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -43,24 +47,29 @@ import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.maxLength
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.foundation.text.input.then
-import androidx.compose.material3.AlertDialogDefaults
-import androidx.compose.material3.BasicAlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ButtonGroup
 import androidx.compose.material3.ButtonGroupDefaults
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
-import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults.extraLargeContainerSize
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.ToggleButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -69,16 +78,28 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.app.ActivityCompat
 import androidx.core.content.edit
 import androidx.core.text.isDigitsOnly
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.delamcode.datatransfer.ui.theme.DatatransferTheme
 import com.delamcode.datatransfer.ui.theme.Typography
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
 import kotlin.properties.Delegates
 
 
@@ -147,6 +168,17 @@ class MainActivity : ComponentActivity() {
             mainViewModel.onOpenDirectory(uri)
         }
 
+    val singleFilePicker =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+            uri?.let {
+                contentResolver.takePersistableUriPermission(
+                    it,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+                mainViewModel.onOpenFile(it)
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -183,16 +215,80 @@ class MainActivity : ComponentActivity() {
             savedBodyHtml = tempBodyHtml
         }
 
+        handleShareIntent(intent)
+
         setContent {
             DatatransferTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+                val snackbarHostState = remember { SnackbarHostState() }
+                Scaffold(
+                    modifier = Modifier.fillMaxSize(),
+                    snackbarHost = { SnackbarHost(snackbarHostState) }
+                ) { innerPadding ->
                     MainScreen(
                         innerPadding = innerPadding,
-                        window = window
+                        window = window,
+                        snackbarHostState = snackbarHostState
                     )
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleShareIntent(intent)
+    }
+
+    private fun handleShareIntent(intent: Intent?) {
+        if (intent?.action == Intent.ACTION_SEND && intent.type != null) {
+            val fileUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra<Parcelable>(Intent.EXTRA_STREAM) as? Uri
+            }
+            fileUri?.let { uri ->
+                lifecycleScope.launch(Dispatchers.IO) {
+                    try {
+                        val cachedUri = copyUriToCache(uri)
+                        if (cachedUri != null) {
+                            withContext(Dispatchers.Main) {
+                                mainViewModel.onOpenFile(cachedUri)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            mainViewModel.showSnackbar("Failed to process shared file: ${e.message}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun copyUriToCache(uri: Uri): Uri? {
+        val returnCursor = contentResolver.query(uri, null, null, null, null) ?: return null
+        val nameIndex = returnCursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        if (!returnCursor.moveToFirst()) {
+            returnCursor.close()
+            return null
+        }
+        val rawFileName = returnCursor.getString(nameIndex)
+        returnCursor.close()
+
+        val cleanFileName = rawFileName.map { ch ->
+            if (ch.isLetterOrDigit() || ch == '.' || ch == '_' || ch == '-') ch else '_'
+        }.joinToString("")
+
+        if (cleanFileName.trim().isEmpty()) return null
+
+        val cacheFile = File(cacheDir, cleanFileName)
+        contentResolver.openInputStream(uri)?.use { inputStream ->
+            FileOutputStream(cacheFile).use { outputStream ->
+                inputStream.copyTo(outputStream)
+            }
+        }
+        return Uri.fromFile(cacheFile)
     }
 
 
@@ -200,9 +296,41 @@ class MainActivity : ComponentActivity() {
     fun MainScreen(
         mainViewModel: MainViewModel = viewModel(),
         innerPadding: PaddingValues,
-        window: Window
+        window: Window,
+        snackbarHostState: SnackbarHostState
     ) {
         val mainUiState by mainViewModel.uiState.collectAsState()
+        val context = LocalContext.current
+        var isFileMode by remember { mutableStateOf(mainUiState.uiRepoState.openFileUri != null) }
+
+        LaunchedEffect(mainUiState.uiRepoState.openFileUri) {
+            if (mainUiState.uiRepoState.openFileUri != null) {
+                isFileMode = true
+            }
+        }
+
+        LaunchedEffect(mainUiState.uiRepoState.openDirectoryUri) {
+            if (mainUiState.uiRepoState.openDirectoryUri != null) {
+                isFileMode = false
+            }
+        }
+
+        LaunchedEffect(mainUiState.uiOnlyState.missingPermission) {
+            if (mainUiState.uiOnlyState.missingPermission.isNotBlank()) {
+                snackbarHostState.showSnackbar(
+                    message = "${mainUiState.uiOnlyState.missingPermission} is a required permission. No data is collected."
+                )
+            }
+        }
+
+        LaunchedEffect(mainUiState.uiRepoState.snackbarMessage) {
+            if (mainUiState.uiRepoState.snackbarMessage.isNotBlank()) {
+                snackbarHostState.showSnackbar(
+                    message = mainUiState.uiRepoState.snackbarMessage
+                )
+                mainViewModel.clearSnackbarMessage()
+            }
+        }
         if (mainUiState.uiRepoState.isCheckedHotspot || mainUiState.uiRepoState.isCheckedServer) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
@@ -230,53 +358,196 @@ class MainActivity : ComponentActivity() {
         }
 
         @Composable
-        fun AlertDialogWrapper(
-            visible: Boolean,
-            onDismiss: () -> Unit,
-            title: String,
-            content: @Composable () -> Unit,
-            actions: @Composable RowScope.() -> Unit = {},
-            leftArrangedActions: @Composable RowScope.() -> Unit = {}
+        fun withHaptic(type: HapticFeedbackType, onClick: () -> Unit): () -> Unit {
+            val haptic = LocalHapticFeedback.current
+            return {
+                haptic.performHapticFeedback(type)
+                onClick()
+            }
+        }
+
+        @OptIn(ExperimentalMaterial3ExpressiveApi::class)
+        @Composable
+        fun CommonDialog(
+            visible: Boolean = true,
+            onDismissRequest: () -> Unit,
+            title: String = "",
+            text: String? = null,
+            confirmButtonText: String? = null,
+            onConfirm: (() -> Unit)? = null,
+            dismissButtonText: String? = null,
+            onDismiss: () -> Unit = onDismissRequest,
+            resetButton: Boolean = false,
+            onExtra: (() -> Unit)? = null,
+            isDestructive: Boolean = false,
+            content: @Composable (() -> Unit)? = null,
         ) {
             if (!visible) return
-            BasicAlertDialog(onDismissRequest = onDismiss) {
+            val interactionSources = remember { List(3) { MutableInteractionSource() } }
+
+            Dialog(
+                onDismissRequest = onDismissRequest,
+                properties = DialogProperties(dismissOnClickOutside = true)
+            ) {
                 Surface(
                     modifier = Modifier
                         .widthIn(max = 560.dp)
                         .wrapContentHeight(),
-                    shape = MaterialTheme.shapes.large,
-                    tonalElevation = AlertDialogDefaults.TonalElevation
+                    shape = MaterialTheme.shapes.extraLarge,
+                    tonalElevation = 8.dp,
+                    color = MaterialTheme.colorScheme.surfaceContainer
                 ) {
                     Column(
-                        modifier = Modifier.padding(16.dp)
+                        modifier = Modifier
+                            .padding(24.dp)
+                            .widthIn(min = 280.dp)
                     ) {
                         if (title.isNotEmpty()) {
-                            Text(text = title, style = MaterialTheme.typography.headlineSmall)
-                            Spacer(Modifier.height(12.dp))
+                            Text(
+                                text = title,
+                                style = MaterialTheme.typography.titleLarge,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
                         }
-                        Column(modifier = Modifier.heightIn(max = 550.dp)) {
-                            content()
+
+                        if (text != null) {
+                            Text(
+                                text = text,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
-                        Spacer(Modifier.height(20.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            content = {
-                                Row(
-                                    horizontalArrangement = Arrangement.Start,
-                                    content = leftArrangedActions
-                                )
-                                Spacer(Modifier.width(12.dp))
-                                Row(
-                                    horizontalArrangement = Arrangement.End,
-                                    content = actions
-                                )
+
+                        if (content != null) {
+                            Column(modifier = Modifier.heightIn(max = 550.dp)) {
+                                content()
                             }
-                        )
+                        }
+
+                        if (confirmButtonText != null || dismissButtonText != null || resetButton) {
+                            Spacer(modifier = Modifier.height(24.dp))
+                            ButtonGroup(
+                                overflowIndicator = { menuState ->
+                                    ButtonGroupDefaults.OverflowIndicator(menuState = menuState)
+                                },
+                            ) {
+                                val scope = this
+                                if (resetButton && onExtra != null) {
+                                    customItem(
+                                        buttonGroupContent = {
+                                            OutlinedButton(
+                                                onClick = withHaptic(HapticFeedbackType.Reject) {
+                                                    onExtra()
+                                                    onDismiss()
+                                                },
+                                                shapes = ButtonDefaults.shapes(),
+                                                modifier = with(scope) {
+                                                    Modifier
+                                                        .weight(0.75f)
+                                                        .animateWidth(interactionSources[0])
+                                                },
+                                                interactionSource = interactionSources[0],
+                                            ) {
+                                                Icon(
+                                                    painter = painterResource(R.drawable.outline_reset_wrench_24),
+                                                    contentDescription = "Reset"
+                                                )
+                                            }
+                                        },
+                                        menuContent = { menuState ->
+                                            DropdownMenuItem(
+                                                text = { Text("Reset") },
+                                                onClick = {
+                                                    onExtra()
+                                                    onDismiss()
+                                                    menuState.dismiss()
+                                                }
+                                            )
+                                        }
+                                    )
+                                }
+                                if (dismissButtonText != null) {
+                                    customItem(
+                                        buttonGroupContent = {
+                                            OutlinedButton(
+                                                onClick = withHaptic(HapticFeedbackType.Reject) {
+                                                    onDismiss()
+                                                },
+                                                shapes = ButtonDefaults.shapes(),
+                                                modifier = with(scope) {
+                                                    Modifier
+                                                        .weight(1f)
+                                                        .animateWidth(interactionSources[1])
+                                                },
+                                                interactionSource = interactionSources[1],
+                                            ) {
+                                                Text(
+                                                    text = dismissButtonText,
+                                                    style = MaterialTheme.typography.labelLarge
+                                                )
+                                            }
+                                        },
+                                        menuContent = { menuState ->
+                                            DropdownMenuItem(
+                                                text = { Text(dismissButtonText) },
+                                                onClick = {
+                                                    onDismiss()
+                                                    menuState.dismiss()
+                                                }
+                                            )
+                                        }
+                                    )
+                                }
+                                if (confirmButtonText != null && onConfirm != null) {
+                                    customItem(
+                                        buttonGroupContent = {
+                                            Button(
+                                                onClick = withHaptic(HapticFeedbackType.Confirm) {
+                                                    onConfirm()
+                                                    onDismiss()
+                                                },
+                                                colors = if (isDestructive) {
+                                                    ButtonDefaults.buttonColors(
+                                                        containerColor = MaterialTheme.colorScheme.error,
+                                                        contentColor = MaterialTheme.colorScheme.onError
+                                                    )
+                                                } else {
+                                                    ButtonDefaults.buttonColors()
+                                                },
+                                                modifier = with(scope) {
+                                                    Modifier
+                                                        .weight(1f)
+                                                        .animateWidth(interactionSources[2])
+                                                },
+                                                interactionSource = interactionSources[2],
+                                                shapes = ButtonDefaults.shapes(),
+                                            ) {
+                                                Text(
+                                                    text = confirmButtonText,
+                                                )
+                                            }
+                                        },
+                                        menuContent = { menuState ->
+                                            DropdownMenuItem(
+                                                text = { Text(confirmButtonText) },
+                                                onClick = {
+                                                    onConfirm()
+                                                    onDismiss()
+                                                    menuState.dismiss()
+                                                }
+                                            )
+                                        }
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+
+
 
         LazyColumn(
             modifier = Modifier
@@ -288,15 +559,84 @@ class MainActivity : ComponentActivity() {
         ) {
             item {
                 Section {
-                    Button(onClick = {
-                        if (!mainUiState.uiRepoState.isCheckedServer) filePicker.launch(null) else mainViewModel.filePickerWarning(
-                            true
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Button(
+                            onClick = {
+                                if (!mainUiState.uiRepoState.isCheckedServer) filePicker.launch(null) else mainViewModel.filePickerWarning(
+                                    true
+                                )
+                            },
+                            enabled = !isFileMode
+                        ) {
+                            Text("Open Dir")
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Switch(
+                            checked = isFileMode,
+                            onCheckedChange = {
+                                isFileMode = it
+                                mainViewModel.onOpenDirectory(null)
+                            },
+                            enabled = !mainUiState.uiRepoState.isCheckedServer
                         )
-                    }) {
-                        Text("Open Dir")
+                        Spacer(Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                if (!mainUiState.uiRepoState.isCheckedServer) singleFilePicker.launch(
+                                    arrayOf("*/*")
+                                ) else mainViewModel.filePickerWarning(
+                                    true
+                                )
+                            },
+                            enabled = isFileMode
+                        ) {
+                            Text("Open File")
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        IconButton(
+                            onClick = {
+                                mainUiState.uiRepoState.openDirectoryUri?.let { uri ->
+                                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                                        val documentUri =
+                                            DocumentsContract.buildDocumentUriUsingTree(
+                                                uri,
+                                                DocumentsContract.getTreeDocumentId(uri)
+                                            )
+                                        setDataAndType(
+                                            documentUri,
+                                            "vnd.android.document/directory"
+                                        )
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    try {
+                                        context.startActivity(intent)
+                                    } catch (e: Exception) {
+                                        mainViewModel.showSnackbar("Could not open directory: ${e.message}")
+                                    }
+                                }
+                            },
+                            enabled = mainUiState.uiRepoState.openDirectoryUri != null
+                        ) {
+                            Icon(
+                                painter = painterResource(R.drawable.outline_open_in_new_24),
+                                contentDescription = "Open directory"
+                            )
+                        }
                     }
                     Spacer(Modifier.height(8.dp))
-                    Text(mainUiState.uiRepoState.openDirectoryUri?.path ?: "No open directory")
+                    val selectionLabel = when {
+                        mainUiState.uiRepoState.openFileUri != null -> {
+                            "Selected File: " + (mainUiState.uiRepoState.openFileUri?.lastPathSegment
+                                ?: "Unknown File")
+                        }
+
+                        mainUiState.uiRepoState.openDirectoryUri != null -> {
+                            "Selected Dir: " + mainUiState.uiRepoState.openDirectoryUri?.path
+                        }
+
+                        else -> "No source selection"
+                    }
+                    Text(selectionLabel)
                 }
             }
             item {
@@ -424,9 +764,9 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        AlertDialogWrapper(
+        CommonDialog(
             visible = mainUiState.uiRepoState.qrCodeBitmap != null,
-            onDismiss = { mainViewModel.hideQrCode() },
+            onDismissRequest = { mainViewModel.hideQrCode() },
             title = "QR Code",
             content = {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -443,64 +783,39 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             },
-            actions = {
-                OutlinedButton(onClick = { mainViewModel.hideQrCode() }) {
-                    Text("Dismiss")
-                }
+            dismissButtonText = "Dismiss"
+        )
+
+        CommonDialog(
+            visible = mainUiState.uiRepoState.showWifiDisabledDialog,
+            onDismissRequest = { mainViewModel.showWifiDisabledDialog(false) },
+            title = "WiFi is disabled",
+            text = "WiFi Aware and WiFi Direct require WiFi to be enabled. Do you want to enable it now?",
+            dismissButtonText = "Cancel",
+            confirmButtonText = "Enable",
+            onConfirm = {
+                context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
             }
         )
 
-        AlertDialogWrapper(
-            visible = mainUiState.uiOnlyState.missingPermission.isNotBlank(),
-            onDismiss = { mainViewModel.showMissingPermissionAlert("") },
-            title = "Missing permission",
-            content = {
-                Text("${mainUiState.uiOnlyState.missingPermission} is a required permission for this function. No data is collected.")
-            },
-            actions = {
-                OutlinedButton(onClick = { mainViewModel.showMissingPermissionAlert("") }) {
-                    Text("Dismiss")
-                }
-            }
-        )
-
-        AlertDialogWrapper(
+        CommonDialog(
             visible = mainUiState.uiOnlyState.filePickerWarning,
-            onDismiss = { mainViewModel.filePickerWarning(false) },
+            onDismissRequest = { mainViewModel.filePickerWarning(false) },
             title = "File transfers could fail",
-            content = {
-                Text("Changing the directory while the server is running could be dangerous. Make sure no file transfers are ongoing.")
-            },
-            actions = {
-                OutlinedButton(onClick = { mainViewModel.filePickerWarning(false) }) { Text("Cancel") }
-                Spacer(Modifier.width(12.dp))
-                FilledTonalButton(
-                    onClick = {
-                        mainViewModel.filePickerWarning(false)
-                        filePicker.launch(null)
-                    }
-                ) {
-                    Text("Continue")
-                }
-            }
-        )
-
-        AlertDialogWrapper(
-            visible = mainUiState.uiRepoState.generalDialog.isNotBlank(),
-            onDismiss = { mainViewModel.showGeneralDialog("") },
-            title = "",
-            content = { Text(mainUiState.uiRepoState.generalDialog) },
-            actions = {
-                OutlinedButton(onClick = { mainViewModel.showGeneralDialog("") }) { Text("Dismiss") }
+            text = "Changing the directory while the server is running could be dangerous. Make sure no file transfers are ongoing.",
+            dismissButtonText = "Cancel",
+            confirmButtonText = "Continue",
+            onConfirm = {
+                filePicker.launch(null)
             }
         )
 
         var fileHtml = savedFileHtml
         var bodyHtml = savedBodyHtml
 
-        AlertDialogWrapper(
+        CommonDialog(
             visible = mainUiState.uiOnlyState.htmlPopup,
-            onDismiss = { mainViewModel.showModifyHtmlPopup(false) },
+            onDismissRequest = { mainViewModel.showModifyHtmlPopup(false) },
             title = "Custom HTML",
             content = {
                 OutlinedTextField(
@@ -526,36 +841,23 @@ class MainActivity : ComponentActivity() {
                         }
                 )
             },
-            leftArrangedActions = {
-                OutlinedButton(
-                    onClick = {
-                        mainViewModel.showModifyHtmlPopup(false)
-                        sharedPref.edit {
-                            putString("fileHtml", defaultFileHtml)
-                            putString("bodyHtml", defaultBody)
-                            apply()
-                        }
-                        savedFileHtml = defaultFileHtml
-                        savedBodyHtml = defaultBody
-                    }
-                ) { Text("Reset") }
+            resetButton = true,
+            onExtra = {
+                sharedPref.edit {
+                    putString("fileHtml", defaultFileHtml)
+                    putString("bodyHtml", defaultBody)
+                    apply()
+                }
+                savedFileHtml = defaultFileHtml
+                savedBodyHtml = defaultBody
             },
-            actions = {
-                OutlinedButton(
-                    onClick = { mainViewModel.showModifyHtmlPopup(false) }
-                ) { Text("Cancel") }
-                Spacer(Modifier.width(12.dp))
-                FilledTonalButton(
-                    onClick = {
-                        sharedPref.edit {
-                            putString("fileHtml", fileHtml)
-                            putString("bodyHtml", bodyHtml)
-                            apply()
-                        }
-                        mainViewModel.showModifyHtmlPopup(false)
-                    }
-                ) {
-                    Text("Save")
+            dismissButtonText = "Cancel",
+            confirmButtonText = "Save",
+            onConfirm = {
+                sharedPref.edit {
+                    putString("fileHtml", fileHtml)
+                    putString("bodyHtml", bodyHtml)
+                    apply()
                 }
             },
         )
